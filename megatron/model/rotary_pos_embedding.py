@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # coding=utf-8
 
 # The following code has been taken from https://github.com/NVIDIA/NeMo/blob/ \
@@ -10,6 +11,16 @@ import torch
 from torch import einsum, nn
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
+try:
+    from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV1
+except ImportError:
+    RotaryPosEmbeddingHelperV1 = None
+
+# sin, cos tensors cached for all devices
+cos_cached = None
+sin_cached = None
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
@@ -47,10 +58,25 @@ def apply_rotary_pos_emb(t, freqs):
     check https://kexue.fm/archives/8265 for detailed formulas
     """
     rot_dim = freqs.shape[-1]
-    # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
-    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+    t_pass = None
+    # due to 0 dim of t_pass tensor, there is zeros tensor DMA from H2D which
+    # affects performance, check whether we need t_pass
+    if t.shape[-1] != rot_dim:
+        # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 
-    # first part is cosine component
-    # second part is sine component, need to change signs with _rotate_half method
-    t = (t * freqs.cos().to(t.dtype)) + (_rotate_half(t) * freqs.sin().to(t.dtype))
+    global cos_cached, sin_cached
+    if cos_cached is None or sin_cached is None:
+        cos_cached = freqs.cos().to(t.dtype)
+        sin_cached = freqs.sin().to(t.dtype)
+
+    if t.device.type == "hpu":
+        assert RotaryPosEmbeddingHelperV1 is not None, "failed to import RotaryPosEmbeddingHelperV1"
+        t = RotaryPosEmbeddingHelperV1.apply(t, cos_cached, sin_cached, 0) # offset already used in RotaryEmbedding.forward
+    else:
+        # first part is cosine component
+        # second part is sine component, need to change signs with _rotate_half method
+        t = (t * cos_cached) + (_rotate_half(t) * sin_cached)
+    if t_pass is None:
+        return t
     return torch.cat((t, t_pass), dim=-1)

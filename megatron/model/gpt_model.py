@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
@@ -16,13 +17,14 @@ from .utils import scaled_init_method_normal
 
 from megatron.model import LayerNorm
 from .language_model import EmbeddingPipe
+from .rmsnorm import RMSNorm
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
 try:
     from apex.normalization import MixedFusedRMSNorm
 except ImportError:
-    MixedFusedRMSNorm = None
+    MixedFusedRMSNorm = RMSNorm
 
 try:         
     from deepspeed.checkpoint import (
@@ -262,6 +264,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                         args.max_position_embeddings,
                                         args.hidden_dropout,
                                         config,
+                                        add_position_embedding=args.add_position_embedding,
                                         num_tokentypes=num_tokentypes,
                                         embedding_weights_in_fp32=args.embedding_weights_in_fp32,))
         else:
@@ -272,6 +275,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                             args.max_position_embeddings,
                                             args.hidden_dropout,
                                             config,
+                                            add_position_embedding=args.add_position_embedding,
                                             num_tokentypes=num_tokentypes,
                                             embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                                             tied_weight_attr='word_embeddings_weight'))
@@ -287,9 +291,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         if args.normalization == 'layernorm':
             self.specs.append(LayerSpec(LayerNorm,
                           args.hidden_size,
-                          eps=args.layernorm_epsilon))
+                          eps=args.layernorm_epsilon,
+                          sequence_parallel=args.sequence_parallel))
         else:
-            self.specs.append(LayerSpec(MixedFusedRMSNorm, args.hidden_size, args.layernorm_epsilon))
+            self.specs.append(LayerSpec(MixedFusedRMSNorm, args.hidden_size,
+                                        args.layernorm_epsilon,
+                                        sequence_parallel=args.sequence_parallel))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
@@ -310,6 +317,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                               args.max_position_embeddings,
                               args.hidden_dropout,
                               config,
+                              add_position_embedding=(args.add_position_embedding and (not args.fix_position_emb_redundant_alloc)),
                               num_tokentypes=num_tokentypes,
                               embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                               forward_fn=_logits_helper,
@@ -320,6 +328,9 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         if args.fp16 or args.bf16:
             self.specs.append(float16_to_fp32)
 
+        # for selective, use --recompute-activations or --recompute-granularity='selective'
+        # for full, use --recompute-granularity='full' --recompute-method='uniform' or
+        # --checkpoint-activations
         if args.checkpoint_activations:
             interval = args.checkpoint_num_layers
         elif args.recompute_granularity == "full" and args.recompute_method == 'uniform':

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
@@ -16,6 +17,9 @@ from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
+from megatron.model.utils import init_method_normal
+
+from deepspeed.accelerator import get_accelerator
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -44,6 +48,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_profiler_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -131,6 +136,11 @@ def validate_args(args):
     #     exit()
     # del args.checkpoint_activations
 
+    if args.checkpoint_activations:
+        assert args.recompute_granularity == 'full', \
+            'cannot use --recompute-granularity=selective with --checkpoint-activations, ' \
+            'for --recompute-granularity=selective use --recompute-activations alone only'
+
     if args.recompute_activations:
         args.recompute_granularity = 'selective'
     del args.recompute_activations
@@ -145,6 +155,8 @@ def validate_args(args):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.eval_micro_batch_size is None:
+        args.eval_micro_batch_size = args.micro_batch_size
     if args.num_layers_per_virtual_pipeline_stage is not None:
         assert args.pipeline_model_parallel_size > 2, \
             'pipeline-model-parallel size should be greater than 2 with ' \
@@ -189,6 +201,9 @@ def validate_args(args):
     if args.use_distributed_optimizer:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
+
+    if get_accelerator().device_name() != "hpu" and args.optimizer == "fusedadamw":
+        args.optimizer = "adamw"
 
     # For torch DDP, we do not use contiguous buffer
     # if args.DDP_impl == 'torch':
@@ -344,15 +359,22 @@ def validate_args(args):
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
+    list_of_formats = [args.fp8_e4m3, args.fp8_hybrid, args.fp8_e5m2]
     # Tranformer-Engine/FP8 related checking
-    if args.fp8_e4m3 or args.fp8_hybrid:
+    if any(list_of_formats):
         assert args.transformer_impl == 'transformer_engine', \
             'transformer-engine required for fp8 training and inference'
 
-    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
-        'cannot train with both fp8 e4m3 and hybrid formatting'
+    assert not (str(list_of_formats).count('True') >= 2), \
+        'fp8 formatting can only be one of: e5m2, e4m3, hybrid'
+
+    assert not (args.fp8_e4m3 and get_accelerator().device_name() == "hpu"), \
+        'hpu does not support e4m3 format type'
 
     if args.recompute_granularity == 'selective':
+        assert not args.partition_activations, \
+            '--partition-activations is supported only with ' \
+            '--recompute-granularity=full' # TODO: [SW-162958]
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
             'selective recomputing granularity'
@@ -375,7 +397,7 @@ def validate_args(args):
         args.async_tensor_model_parallel_allreduce = False
 
     if not args.use_dataset_only:
-        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if get_accelerator().device_name() == "cuda" and os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
             if args.sequence_parallel:
                 raise RuntimeError(
                     "Using sequence parallelism requires setting the environment variable "
@@ -406,6 +428,17 @@ def validate_args(args):
 
     # FlashAttention
     args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
+    if get_accelerator().device_name() != "hpu":
+        args.use_fused_sdpa = False
+    else:
+        if args.use_fused_sdpa_with_recompute:
+            args.use_fused_sdpa = args.use_fused_sdpa_with_recompute
+        if args.use_fused_sdpa and args.recompute_granularity:
+            assert args.use_fused_sdpa_with_recompute is False, "Please use either " \
+            "use_fused_sdpa_with_recompute or recompute_granularity only but not both"
+
+    if get_accelerator().device_name() != "hpu" or args.normalization != "rmsnorm":
+        args.use_fused_rmsnorm = False
 
     # AML
     if args.aml_data_download_path is not None:
@@ -469,15 +502,28 @@ def core_transformer_config_from_args(args):
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
+    if args.no_scaled_init:
+        kw_args['output_layer_init_method'] = init_method_normal(args.init_method_std)
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
-        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['output_layer_init_method'] = torch.nn.init.xavier_uniform_
 
     return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
+    group.add_argument('--cache-fp8-weight',
+                       default=False,
+                       action='store_true',
+                       help='Cache fp8 weight from forward to backward. \
+                           This will increase memory usage, but improve performance.')
+    group.add_argument('--cache-fp8-weight-fwd',
+                       type=lambda x: x.lower() in ['true', '1'],
+                       default=True,
+                       help='In forward, calculate fp8 weight only once for the entire batch.')
+    group.add_argument('--fp8-e5m2', action='store_true',
+                        help='E5M2 TransformerLayer', dest='fp8_e5m2')
     group.add_argument('--fp8-e4m3', action='store_true',
                         help='E4M3 TransformerLayer', dest='fp8_e4m3')
     group.add_argument('--fp8-hybrid', action='store_true',
@@ -621,6 +667,10 @@ def _add_network_size_args(parser):
                        help='Options for layer normalization type:'
                             '  layernorm'
                             '  rmsnorm')
+    group.add_argument('--use-fused-rmsnorm',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=True,
+                        help='Enable FusedRMSNorm when rmsnorm normalization is used.')
     group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
                        help='Layer norm epsilon.')
     group.add_argument('--apply-layernorm-1p', action='store_true',
@@ -653,6 +703,14 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.'),
     group.add_argument('--embedding-weights-in-fp32', action='store_true',
                        help='Cast word embedding weights to fp32 before embedding fwd.'),
+    group.add_argument('--fix-position-emb-redundant-alloc', action='store_true',
+                       help='If true, will not allocate position embeddings at '
+                       'the embed object that is used to generate logits.')
+    group.add_argument('--embed-layernorm', action='store_true',
+                       help='use layernorm for embedding')
+    group.add_argument('--kill-switch-path', type=str, default=None,
+                       help='Path to look for a kill switch. '
+                            'If found will automatically exit the program.')
     return parser
 
 
@@ -754,6 +812,8 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--do-norm-bias-weight-decay', action='store_true',
+                       help='Enable Weight Decay for LayerNorm/Norm (weight and bias) and all Bias Parameters')
 
     return parser
 
@@ -765,6 +825,9 @@ def _add_training_args(parser):
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size times number of micro batches.')
+    group.add_argument('--eval-micro-batch-size', type=int, default=None,
+                       help='Batch size per model instance (local batch size) for evaluation. '
+                       'If not defined, using --micro-batch-size value instead')
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
@@ -888,11 +951,19 @@ def _add_training_args(parser):
                        'https://arxiv.org/abs/2307.08691')
     group.add_argument('--use-flash-attn-triton', action='store_true',
                        help='use FlashAttention implementation of attention using Triton.')
+    group.add_argument('--use-fused-sdpa',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=True,
+                        help='Enable Fused Scaled Dot Product Attention.')
+    group.add_argument('--use-fused-sdpa-with-recompute',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=False,
+                        help='Enable Fused Scaled Dot Product Attention with recompute feature.')
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'adamw', 'fusedadamw'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
@@ -951,6 +1022,10 @@ def _add_initialization_args(parser):
                        'distribution used for weight initialization.')
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
+    group.add_argument('--no-scaled-init', action='store_true',
+                       help='No scaled initialization with number of '
+                       'layers and have same init method for all the model '
+                       'parameters')
 
     return parser
 
@@ -1044,6 +1119,12 @@ def _add_checkpointing_args(parser):
                        "initialization.")
     group.add_argument('--universal-checkpoint', action='store_true',
                         help='Loading a universal format checkpoint.')
+    group.add_argument('--verify-checkpoint', action='store_true',
+                       help='Run verification on saved checkpoint.')
+    group.add_argument("--verify-checkpoint-model-type", default='GPT', type=str,
+                       help='Model family type, used for checkpoint verification only.',
+                       choices=['GPT', 'BLOOM', 'LLAMA'])
+
     return parser
 
 
@@ -1110,7 +1191,7 @@ def _add_distributed_args(parser):
                        help='overlap pipeline parallel communication with forward and backward chunks',
                        dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo', 'ccl'],
+                       choices=['nccl', 'gloo', 'ccl', 'hccl'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
                        help='Timeout minutes for torch.distributed.')
@@ -1168,6 +1249,8 @@ def _add_validation_args(parser):
     group.add_argument('--skip-train', action='store_true',
                        default=False, help='If set, bypass the training loop, '
                        'optionally do evaluation for validation/test, and exit.')
+    group.add_argument('--eval-loss-exit-value', type=float, default=None,
+                       help='Eval loss value below which the training will exit')
 
     return parser
 
@@ -1276,6 +1359,12 @@ def _add_data_args(parser):
                        help='Force to use certain index file.')
     group.add_argument('--train-shuffle-idx-path', type=str, default=None,
                        help='Force to use certain index file.')
+    group.add_argument('--mask-tensor-adding', action='store_true',
+                       help='Perform attention masking by adding tensor instead of doing fill')
+    group.add_argument('--no-seq-len-plus-one-tokens',
+                       action='store_false', help='If set, dont get '
+                       'sequence length plus one tokens for training',
+                       dest='use_seq_len_plus_one_tokens')
     return parser
 
 
@@ -1498,5 +1587,22 @@ def _add_distillation_args(parser):
     
     group.add_argument('--load-teacher', type=str, default=None,
                        help='Directory containing a teacher model checkpoint.')
+
+    return parser
+
+
+def _add_profiler_args(parser):
+    group = parser.add_argument_group(title='profiling configuration')
+
+    group.add_argument("--profile",
+     type=str,
+     default=None,
+     choices=['pt', 'pt-full', 'hltv'],
+     help="Enable profiling")
+
+    group.add_argument("--profile-steps",
+     type=str,
+     default='3,4',
+     help="Which steps to profile. Format: <start step>,<end step>")
 
     return parser

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
@@ -11,13 +12,14 @@ import json
 _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from contextlib import nullcontext
 
 from megatron import get_args
 from megatron import get_signal_handler
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_current_global_batch_size
-from megatron import get_num_microbatches
+from megatron import get_num_microbatches, get_num_eval_microbatches
 from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
@@ -35,13 +37,16 @@ from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import unwrap_model
+from megatron.utils import unwrap_model, found_kill_switch
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb, get_fp8_recipe
+from megatron.core.tensor_parallel.data import reset_cached_broadcast_sizes
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
+from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
@@ -56,6 +61,12 @@ try:
 except (ImportError, ModuleNotFoundError):
     wandb = None
 
+try:
+    from habana_frameworks.torch.hpex.experimental.transformer_engine import fp8_autocast
+    from habana_frameworks.torch.hpex.experimental.transformer_engine import recipe
+except (ImportError, ModuleNotFoundError):
+    fp8_autocast = None
+    recipe = None
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -124,6 +135,14 @@ def pretrain(train_valid_test_dataset_provider,
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
+
+    args = get_args()
+
+    if found_kill_switch():
+        print_datetime(f"Detected kill switch at {args.kill_switch_path}. Exiting")
+        torch.distributed.barrier()
+        sys.exit()
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     if get_accelerator().device_name() == 'cuda':
         set_jit_fusion_options()
@@ -140,7 +159,6 @@ def pretrain(train_valid_test_dataset_provider,
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
 
-    args = get_args()
     timers = get_timers()
 
     if args.deepspeed:
@@ -238,21 +256,23 @@ def pretrain(train_valid_test_dataset_provider,
         print_rank_0('skipping training (--skip-train is on) ...')
 
         iteration = args.iteration
+        if args.save and (iteration != 0 or args.universal_checkpoint):
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
     config = core_transformer_config_from_args(args)
     if args.do_valid:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   valid_data_iterator, model,
-                                   iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train)
+        _ = evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator, model,
+                                       iteration, process_non_loss_data_func, config,
+                                       verbose=True, write_to_tensorboard=not args.skip_train)
 
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   test_data_iterator, model,
-                                   iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train, test=True)
+        _ = evaluate_and_print_results(prefix, forward_step_func,
+                                       test_data_iterator, model,
+                                       iteration, process_non_loss_data_func, config,
+                                       verbose=True, write_to_tensorboard=not args.skip_train, test=True)
     return model
 
 
@@ -372,7 +392,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Disallow training and inference with Transformer Engine
     # for non-GPT models
-    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    args.allow_transformer_engine = all([type(m).__name__ in ['GPTModelPipe', 'GPTModel'] for m in model])
     assert args.allow_transformer_engine or args.transformer_impl == 'local', \
         'Transformer Engine is only approved for GPT models'
 
@@ -660,12 +680,16 @@ def train_step(forward_step_func, data_iterator,
     """Single training step."""
     args = get_args()
     timers = get_timers()
-
+    hpu_transformer_engine = get_accelerator().device_name() == 'hpu' and get_args().transformer_impl == "transformer_engine"
     if args.deepspeed and args.ds_pipeline_enabled:
         skipped_iter = 0
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
-        loss = model[0].train_batch(data_iter=data_iterator)
+
+        with fp8_autocast(enabled=True, fp8_recipe=get_fp8_recipe(args)) \
+            if hpu_transformer_engine else nullcontext():
+            loss = model[0].train_batch(data_iter=data_iterator)
+
         grad_norm = model[0].get_global_grad_norm()
         return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
 
@@ -880,7 +904,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
                               args.consumed_train_tokens)
-        if args.fp16 and args.log_loss_scale_to_tensorboard:
+        if args.fp16 and (loss_scale and args.log_loss_scale_to_tensorboard):
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
@@ -1131,6 +1155,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Write args to tensorboard
     write_args_to_tensorboard()
 
+    setup_profiler(args, get_accelerator().device_name())
+
     if args.random_ltd:
         # random-ltd requires different randomness on each rank
         import random
@@ -1161,6 +1187,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        trigger(on_step_begin)
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
             # inform deepspeed of any batch size changes
@@ -1237,10 +1264,20 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
             prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       config, False)
+            eval_loss = evaluate_and_print_results(prefix, forward_step_func,
+                                                   valid_data_iterator, model,
+                                                   iteration,
+                                                   process_non_loss_data_func,
+                                                   config, False)
+            # Exiting based on eval loss
+            if args.eval_loss_exit_value is not None and eval_loss <= args.eval_loss_exit_value:
+                if args.save:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler)
+                torch.distributed.barrier()
+                print_datetime(f"Reached target loss value: {args.eval_loss_exit_value}. "
+                            f"Stopping the training at iteration: {iteration} with loss: {eval_loss}")
+                sys.exit()
 
         # Checkpointing
         saved_checkpoint = False
@@ -1281,7 +1318,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()
+        trigger(on_step_end)
 
+        # Exiting based on kill-switch
+        if found_kill_switch():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler)
+            print_datetime(f"Detected kill switch at {args.kill_switch_path}, "
+                           f"iteration={iteration}. Exiting")
+            torch.distributed.barrier()
+            sys.exit()
 
     return iteration
 
@@ -1314,12 +1361,29 @@ def evaluate(forward_step_func,
                 update_rotary_pos_emb(args.curriculum_seqlen)
             model[0].reset_activation_shape()
 
+    if args.eval_micro_batch_size != args.micro_batch_size:
+        reset_cached_broadcast_sizes()
+        model[0].reset_activation_shape()
+
     total_loss_dict = {}
 
     with torch.no_grad():
         iteration = 0
-        while iteration < args.eval_iters:
+        total_iterations = args.eval_iters
+        if args.eval_iters == -1:
+            print_rank_0(F"Evaluation on the entire set as eval-iters is set to {args.eval_iters}")
+            samples_per_iteration = mpu.get_data_parallel_world_size() \
+                                        * args.eval_micro_batch_size \
+                                        * get_num_eval_microbatches()
+            total_iterations = math.ceil(args.eval_total_samples / samples_per_iteration)
+            print_rank_0(F"Evaluation Iterations: {total_iterations}, Total Eval Samples: {args.eval_total_samples}, samples per iteration: {samples_per_iteration}")
+            args.consumed_valid_samples = 0
+        num_eval_microbatches = get_num_eval_microbatches()
+        while iteration < total_iterations:
             iteration += 1
+            if iteration == total_iterations and args.eval_iters == -1:
+                num_eval_microbatches = math.ceil((args.eval_total_samples - args.consumed_valid_samples) / \
+                                (mpu.get_data_parallel_world_size() * args.eval_micro_batch_size))
             if verbose and iteration % args.log_interval == 0:
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
@@ -1330,9 +1394,12 @@ def evaluate(forward_step_func,
             if args.deepspeed and args.ds_pipeline_enabled:
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
-                loss = model[0].eval_batch(data_iterator)
-                loss_dicts = [{'lm loss' : loss}] * get_num_microbatches()
+                loss = model[0].eval_batch(data_iterator, eval_micro_batches=num_eval_microbatches)
+                loss_dicts = [{'lm loss' : loss}] * num_eval_microbatches
             else:
+                assert args.micro_batch_size == args.eval_micro_batch_size, \
+                        "evaluate (training) - Megatron's forward_backward_func options - " \
+                        "Unsupported for split micro batch size"
                 loss_dicts = forward_backward_func(
                     forward_step_func=forward_step_func,
                     data_iterator=data_iterator,
@@ -1357,8 +1424,8 @@ def evaluate(forward_step_func,
                                 key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
-                                           * args.micro_batch_size \
-                                           * get_num_microbatches()
+                                           * args.eval_micro_batch_size \
+                                           * num_eval_microbatches
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -1377,7 +1444,7 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+        total_loss_dict[key] /= (((total_iterations-1) * get_num_eval_microbatches()) + num_eval_microbatches)
 
     if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
         # roll back to actual curriculum seqlen at the end of eval.
@@ -1388,6 +1455,9 @@ def evaluate(forward_step_func,
                 update_rotary_pos_emb(args.curriculum_seqlen)
             model[0].reset_activation_shape()
 
+    if args.eval_micro_batch_size != args.micro_batch_size:
+        reset_cached_broadcast_sizes()
+        model[0].reset_activation_shape()
     return total_loss_dict, collected_non_loss_data
 
 def evaluate_and_print_results(prefix, forward_step_func,
@@ -1405,20 +1475,22 @@ def evaluate_and_print_results(prefix, forward_step_func,
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
     string = ' validation loss at {} | '.format(prefix)
+    eval_loss = 0
     for key in total_loss_dict:
-        string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-        ppl = math.exp(min(20, total_loss_dict[key].item()))
+        eval_loss = total_loss_dict[key].item()
+        string += '{} value: {:.6E} | '.format(key, eval_loss)
+        ppl = math.exp(min(20, eval_loss))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
         if writer and is_last_rank():
             data_type = 'test' if test else 'validation'
             writer.add_scalar(f'lm-loss-validation/{key} {data_type}',
-                              total_loss_dict[key].item(),
+                              eval_loss,
                               iteration)
             writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs samples',
-                              total_loss_dict[key].item(),
+                              eval_loss,
                               args.consumed_train_samples)
             writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs tokens',
-                              total_loss_dict[key].item(),
+                              eval_loss,
                               args.consumed_train_tokens)
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl', ppl,
@@ -1435,6 +1507,13 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_last('-' * length)
     print_rank_last(string)
     print_rank_last('-' * length)
+
+    if args.eval_loss_exit_value is not None:
+        eval_loss_tensor = get_accelerator().FloatTensor([eval_loss])
+        torch.distributed.all_reduce(eval_loss_tensor, op=torch.distributed.ReduceOp.MAX)
+        eval_loss = eval_loss_tensor.item()
+
+    return eval_loss
 
 
 def cyclic_iter(iter):
@@ -1456,9 +1535,13 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
     eval_iters = (args.train_iters // args.eval_interval + 1) * \
                  args.eval_iters
     test_iters = args.eval_iters
-    train_val_test_num_samples = [train_samples,
-                                  eval_iters * args.global_batch_size,
-                                  test_iters * args.global_batch_size]
+    if args.eval_iters == -1:
+        print_rank_0("Evaluation iterations are set to -1")
+        train_val_test_num_samples = [train_samples, -1, -1]
+    else:
+        train_val_test_num_samples = [train_samples,
+                                      eval_iters * args.global_batch_size,
+                                      test_iters * args.global_batch_size]
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
@@ -1496,22 +1579,31 @@ def build_train_valid_test_data_loaders(
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
             build_train_valid_test_datasets_provider)
 
+        if args.eval_iters == -1:
+            eval_total_samples = len(valid_ds)
+            consumed_valid_samples = 0
+            use_all_eval_samples = True
+        else:
+            eval_total_samples = 0
+            consumed_valid_samples = args.consumed_valid_samples
+            use_all_eval_samples = False
+
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
-            train_ds, args.consumed_train_samples)
+            train_ds, args.consumed_train_samples, True)
         valid_dataloader = build_pretraining_data_loader(
-            valid_ds, args.consumed_valid_samples)
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            valid_ds, consumed_valid_samples, False, use_all_eval_samples)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0, False)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloader is not None and args.eval_iters > 0
+        do_valid = valid_dataloader is not None and (args.eval_iters > 0 or args.eval_iters == -1)
         do_test = test_dataloader is not None and args.eval_iters > 0
         # Need to broadcast num_tokens and num_type_tokens.
         flags = get_accelerator().LongTensor(
-            [int(do_train), int(do_valid), int(do_test)])
+            [int(do_train), int(do_valid), int(do_test), int(eval_total_samples)])
     else:
-        flags = get_accelerator().LongTensor([0, 0, 0])
+        flags = get_accelerator().LongTensor([0, 0, 0, 0])
 
     # Broadcast num tokens.
     if ds_sequence_parallel:
@@ -1525,6 +1617,7 @@ def build_train_valid_test_data_loaders(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
+    args.eval_total_samples = flags[3].item()
 
     return train_dataloader, valid_dataloader, test_dataloader
 
@@ -1551,7 +1644,7 @@ def build_train_valid_test_data_iterators(
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
+        valid_data_iterator = iter(valid_dataloader) if (dl_type == 'single' and args.eval_iters != -1) \
                               else iter(cyclic_iter(valid_dataloader))
     else:
         valid_data_iterator = None

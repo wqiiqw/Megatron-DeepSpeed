@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
@@ -10,6 +11,7 @@ from typing import Optional
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
 from .module import MegatronModule
+from .rmsnorm import RMSNorm
 from megatron.core import parallel_state, tensor_parallel, mpu
 from megatron.core.enums import ModelType
 from megatron.model import LayerNorm
@@ -49,11 +51,22 @@ except ImportError:
 
 FlashAttentionBuilder = get_accelerator().get_op_builder("FlashAttentionBuilder")
 flash_attn_builder = None
+try:
+    flash_attn_builder = FlashAttentionBuilder().load()
+except (TypeError, ValueError):
+    flash_attn_builder = None
 
 try:
     from apex.normalization import MixedFusedRMSNorm
 except ImportError:
-    MixedFusedRMSNorm = None
+    MixedFusedRMSNorm = RMSNorm
+
+try:
+    import habana_frameworks.torch.hpu as hthpu
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+except ImportError:
+    hthpu = None
+    FusedSDPA = None
 
 
 """ We use the following notation throughout this file:
@@ -237,7 +250,7 @@ class CoreAttention(MegatronModule):
         self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
-        self.layer_number = max(1, layer_number)
+        self.layer_number = max(1, layer_number+1)
         self.attn_mask_type = attn_mask_type
         self.sequence_parallel = config.sequence_parallel
 
@@ -273,7 +286,7 @@ class CoreAttention(MegatronModule):
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
+        self.attention_dropout = torch.nn.Dropout(config.attention_dropout) if config.attention_dropout != 0 else None
 
     def forward(self, query_layer, key_layer,
                 value_layer, attention_mask):
@@ -318,13 +331,14 @@ class CoreAttention(MegatronModule):
         attention_probs = self.scale_mask_softmax(attention_scores,
                                                   attention_mask)
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        if not self.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+        if self.attention_dropout is not None:
+            # This is actually dropping out entire tokens to attend to, which might
+            # seem a bit unusual, but is taken from the original Transformer paper.
+            if not self.sequence_parallel:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    attention_probs = self.attention_dropout(attention_probs)
+            else:
                 attention_probs = self.attention_dropout(attention_probs)
-        else:
-            attention_probs = self.attention_dropout(attention_probs)
 
         # =========================
         # Context layer. [sq, b, hp]
@@ -476,6 +490,49 @@ class FlashSelfAttentionTriton(torch.nn.Module):
         output = rearrange(output, 'b s h d -> s b (h d)').contiguous()
         return output
 
+
+class HabanaFlashSelfAttention(MegatronModule):
+
+    def __init__(self, config, attn_mask_type=AttnMaskType.padding):
+        super(HabanaFlashSelfAttention, self).__init__()
+        assert hthpu is not None, "Failed to import hthpu"
+        assert FusedSDPA is not None, "Failed to import FusedSDPA"
+        self.attn_mask_type = attn_mask_type
+        self.attention_dropout_p = config.attention_dropout
+        self.use_fused_sdpa = config.use_fused_sdpa
+        self.use_fused_sdpa_with_recompute = config.use_fused_sdpa_with_recompute
+
+        # Per attention head and per partition values.
+        seq_parallel_world_size = 1
+        if parallel_state.sequence_parallel_is_initialized():
+            seq_parallel_world_size = parallel_state.get_sequence_parallel_world_size()
+        world_size = seq_parallel_world_size if seq_parallel_world_size > 1 else parallel_state.get_tensor_model_parallel_world_size()
+
+        projection_size = config.kv_channels * config.num_attention_heads
+        self.hidden_size_per_partition = core.utils.divide(projection_size,
+                                                           world_size)
+
+    def forward(self, query_layer, key_layer,
+                value_layer, attention_mask):
+        # [sq, b, np, hn] -> [b, np, sq, hn]
+        q, k, v = [x.transpose(0, 1).transpose(1, 2) for x in [query_layer, key_layer, value_layer]]
+        causal = True
+        scale = None
+        attn_mask = None
+        with hthpu.sdp_kernel(enable_recompute=self.use_fused_sdpa_with_recompute):
+            context_layer = FusedSDPA.apply(q, k, v, attn_mask, self.attention_dropout_p, causal, scale)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + \
+            (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer
+
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -495,12 +552,15 @@ class ParallelAttention(MegatronModule):
         self.sequence_parallel = config.sequence_parallel
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
+        # TODO - Remove self.attention_dropout usage when SW-172239 is solved
+        self.attention_dropout = config.attention_dropout
         self.use_gqa = (self.num_attention_heads != self.num_key_value_heads)
 
         self.use_flash_attn = (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2) \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         self.use_flash_attn_triton = args.use_flash_attn_triton
+        self.use_fused_sdpa = config.use_fused_sdpa
         if self.use_flash_attn:
             global flash_attn_builder
             try:
@@ -574,6 +634,8 @@ class ParallelAttention(MegatronModule):
             local_attn = FlashSelfAttentionTriton(causal=True, attention_dropout=args.attention_dropout)
         elif self.use_flash_attn:
             local_attn = FlashSelfAttention(causal=True, attention_dropout=config.attention_dropout)
+        elif self.use_fused_sdpa:
+            local_attn = HabanaFlashSelfAttention(config, self.attn_mask_type)
         else:
             local_attn = CoreAttention(self.layer_number, config, self.attn_mask_type)
 
@@ -637,16 +699,22 @@ class ParallelAttention(MegatronModule):
         slen, batch, num_key_value_heads_per_partition, head_dim = hidden_states.shape
         if n_rep == 1:
             return hidden_states
-        hidden_states = hidden_states[:, :, :, None, :].expand(
-            slen, batch, num_key_value_heads_per_partition, n_rep, head_dim)
-        return hidden_states.reshape(slen, batch,
-                                     num_key_value_heads_per_partition * n_rep,
-                                     head_dim)
+        elif num_key_value_heads_per_partition == 1:
+            # If no of KV heads is 1 then just perform expand operation
+            # instead of unsqueeze, expand and reshape to match query states.
+            return hidden_states.expand(slen, batch, n_rep, head_dim)
+        else:
+            hidden_states = hidden_states[:, :, :, None, :].expand(
+                slen, batch, num_key_value_heads_per_partition, n_rep, head_dim)
+            return hidden_states.reshape(slen, batch,
+                                        num_key_value_heads_per_partition * n_rep,
+                                        head_dim)
                                      
     def split_tensor(self, mixed_x_layer):
-        query_layer = mixed_x_layer[:, :, :, :-2, :].reshape(mixed_x_layer.shape[:2] + (-1, self.hidden_size_per_attention_head))
-        key_layer = mixed_x_layer[:, :, :, -2, :]
-        value_layer = mixed_x_layer[:, :, :, -1, :]
+        query_layer, key_layer, value_layer = torch.split(mixed_x_layer, [self.num_key_value_groups, 1, 1], dim=-2)
+        query_layer = query_layer.reshape(mixed_x_layer.shape[:2] + (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head))
+        key_layer = torch.squeeze(key_layer, -2)
+        value_layer = torch.squeeze(value_layer, -2)
 
         return query_layer, key_layer, value_layer
 
@@ -693,8 +761,9 @@ class ParallelAttention(MegatronModule):
              key_layer,
              value_layer) = self.split_tensor(mixed_x_layer)
 
-            # Repeat kv
-            if self.use_gqa:
+            # Repeat kv ; fused SPDA internally handles it
+            # TODO - Remove self.attention_dropout check when SW-172239 is solved
+            if self.use_gqa and (not self.use_fused_sdpa or self.attention_dropout != 0):
                 key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
                 value_layer = self.repeat_kv(value_layer,
                                              self.num_key_value_groups)
@@ -833,7 +902,10 @@ def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
     if bias is not None:
         x = x + bias
-    out = torch.nn.functional.dropout(x, p=prob, training=training)
+    if prob == 0:
+        out = x
+    else:
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
     out = residual + out
     return out
 
@@ -886,7 +958,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layernorm on the input data.
         if args.normalization == 'layernorm':
-            if get_accelerator().device_name() == 'cuda':
+            if get_accelerator().device_name() in ['cuda', 'hpu']:
                 self.input_layernorm = LayerNorm(
                     config.hidden_size,
                     eps=config.layernorm_epsilon,
@@ -899,7 +971,9 @@ class ParallelTransformerLayer(MegatronModule):
                     config.hidden_size,
                     eps=config.layernorm_epsilon)
         else:
-            self.input_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+            self.input_layernorm = MixedFusedRMSNorm(config.hidden_size,
+                                                     config.layernorm_epsilon,
+                                                     sequence_parallel=config.sequence_parallel)
         # Self attention.
         self.self_attention = ParallelAttention(
             config,
@@ -912,7 +986,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layernorm on the attention output
         if args.normalization == 'layernorm':
-            if get_accelerator().device_name() == 'cuda':
+            if get_accelerator().device_name() in ['cuda', 'hpu']:
                 self.post_attention_layernorm = LayerNorm(
                     config.hidden_size,
                     eps=config.layernorm_epsilon,
@@ -925,7 +999,9 @@ class ParallelTransformerLayer(MegatronModule):
                     config.hidden_size,
                     eps=config.layernorm_epsilon)
         else:
-            self.post_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+            self.post_attention_layernorm = MixedFusedRMSNorm(config.hidden_size,
+                                                              config.layernorm_epsilon,
+                                                              sequence_parallel=config.sequence_parallel)
             # Cross attention.
         if self.layer_type in (LayerType.decoder,
                                LayerType.retro_decoder,
@@ -945,7 +1021,9 @@ class ParallelTransformerLayer(MegatronModule):
                     apply_layernorm_1p=args.apply_layernorm_1p,
                     mem_efficient_ln=args.mem_efficient_ln)
             else:
-                self.post_inter_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+                self.post_inter_attention_layernorm = MixedFusedRMSNorm(config.hidden_size,
+                                                                        config.layernorm_epsilon,
+                                                                        sequence_parallel=config.sequence_parallel)
 
         # MLP
         self.num_experts = num_experts
@@ -986,8 +1064,7 @@ class ParallelTransformerLayer(MegatronModule):
         # Retriever (bi-directional transformer with cross attention)
         if layer_type == LayerType.retro_decoder_with_retriever:
             self.retriever = ParallelTransformer(
-                init_method,
-                output_layer_init_method,
+                config=config,
                 model_type=ModelType.retro_encoder,
                 self_attn_mask_type=AttnMaskType.padding,
                 pre_process=True,
@@ -1507,6 +1584,7 @@ class ParallelTransformer(MegatronModule):
         self.transformer_impl = args.transformer_impl
         self.retro_add_retriever = args.retro_add_retriever
         self.ds_inference = args.ds_inference
+        self.device_name = get_accelerator().device_name()
 
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
@@ -1519,9 +1597,10 @@ class ParallelTransformer(MegatronModule):
 
         self.sequence_parallel = config.sequence_parallel
 
+        self.use_fp8 = False
         # Transformer Engine Init.
         self.transformer_engine_rope_available = False
-        if self.transformer_impl == 'transformer_engine':
+        if self.transformer_impl == 'transformer_engine' and self.device_name == 'cuda':
             global transformer_engine
             import transformer_engine
             from importlib.metadata import version
@@ -1533,23 +1612,23 @@ class ParallelTransformer(MegatronModule):
 
             del version, packaging
 
-        self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
-        self.fp8_recipe = None
-        self.fp8_group = None
-        if self.use_fp8:
-            self.fp8_group = parallel_state.get_data_parallel_group()
-            if args.fp8_e4m3:
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif args.fp8_hybrid:
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            self.fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
-                margin=args.fp8_margin,
-                interval=args.fp8_interval,
-                fp8_format=fp8_format,
-                amax_history_len=args.fp8_amax_history_len,
-                amax_compute_algo=args.fp8_amax_compute_algo,
-                override_linear_precision=(False, False, not args.fp8_wgrad),
-            )
+            self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
+            self.fp8_recipe = None
+            self.fp8_group = None
+            if self.use_fp8:
+                self.fp8_group = parallel_state.get_data_parallel_group()
+                if args.fp8_e4m3:
+                    fp8_format = transformer_engine.common.recipe.Format.E4M3
+                elif args.fp8_hybrid:
+                    fp8_format = transformer_engine.common.recipe.Format.HYBRID
+                self.fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                    margin=args.fp8_margin,
+                    interval=args.fp8_interval,
+                    fp8_format=fp8_format,
+                    amax_history_len=args.fp8_amax_history_len,
+                    amax_compute_algo=args.fp8_amax_compute_algo,
+                    override_linear_precision=(False, False, not args.fp8_wgrad),
+                )
 
         self.num_microbatches_in_previous_step = -1
         self.microbatch_count = 0
@@ -1578,7 +1657,7 @@ class ParallelTransformer(MegatronModule):
             assert args.transformer_impl == 'local', \
                 "Transformer engine does not support Retro layers."
         def build_layer(layer_number, n_e):
-            if args.transformer_impl == 'local':
+            if args.transformer_impl == 'local' or self.device_name == 'hpu':
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
@@ -1696,7 +1775,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             if args.normalization == 'layernorm':
-                if get_accelerator().device_name() == 'cuda':
+                if get_accelerator().device_name() in ['cuda', 'hpu']:
                     self.final_layernorm = LayerNorm(
                         config.hidden_size,
                         eps=config.layernorm_epsilon,
@@ -1709,7 +1788,9 @@ class ParallelTransformer(MegatronModule):
                         config.hidden_size,
                         eps=config.layernorm_epsilon)
             else:
-                self.final_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+                self.final_layernorm = MixedFusedRMSNorm(config.hidden_size,
+                                                         config.layernorm_epsilon,
+                                                         sequence_parallel=config.sequence_parallel)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
@@ -5,6 +6,7 @@
 import random
 import os
 import time
+import shutil
 
 import numpy as np
 import torch
@@ -48,12 +50,14 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     for key in args_defaults:
         # The args_defaults is for those who want to set default value or pass parameters when
         # calling Python functions. Instead of using arguments passed in from outside the program.
-        if args.rank == 0:
-            print('INFO: overriding default arguments for {key}:{v} \
-                   with {key}:{v2}'.format(key=key, v=getattr(args, key),
-                                           v2=args_defaults[key]),
-                                           flush=True)
-        setattr(args, key, args_defaults[key])
+        if getattr(args, key) is not None:
+            if args.rank == 0:
+                print('INFO: overriding default arguments for {key}:{v} \
+                    with {key}:{v2}'.format(key=key, v=getattr(args, key),
+                                            v2=args_defaults[key]),
+                                            flush=True)
+        else:
+            setattr(args, key, args_defaults[key])
 
 
     if args.use_checkpoint_args or args_defaults.get('use_checkpoint_args', False):
@@ -65,6 +69,11 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(args)
+
+    # profiler config, must be done before hpu initialization
+    if args.profile == 'hltv':
+        os.environ['HABANA_PROFILE'] = 'profile_api_with_nics'
+        shutil.rmtree('.graph_dumps', ignore_errors=True)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -229,7 +238,7 @@ def _initialize_distributed():
     else:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
-                backend=args.distributed_backend,
+                backend=get_accelerator().communication_backend_name(),
                 world_size=args.world_size, rank=args.rank,
                 timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
