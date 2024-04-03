@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Blendable dataset."""
@@ -9,6 +10,7 @@ import time
 import numpy as np
 import torch
 
+from deepspeed.accelerator import get_accelerator
 from megatron import print_rank_0
 from megatron.core import mpu
 
@@ -23,6 +25,11 @@ class BlendableDataset(torch.utils.data.Dataset):
         assert num_datasets == len(weights)
 
         self.size = size
+
+        if size == -1:
+            self.size = 0
+            for dataset in self.datasets:
+                self.size += len(dataset)
 
         # Normalize weights.
         weights = np.array(weights, dtype=np.float64)
@@ -79,7 +86,7 @@ class BlendableDataset(torch.utils.data.Dataset):
                     cache_success = False
 
 
-            counts = torch.cuda.LongTensor([cache_success])
+            counts = get_accelerator().LongTensor([cache_success])
             torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
             torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
             if counts[0].item() != (

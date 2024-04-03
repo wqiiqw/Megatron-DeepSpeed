@@ -1,7 +1,8 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from deepspeed.accelerator.real_accelerator import get_accelerator
-if get_accelerator().device_name() == 'cuda':
+if get_accelerator().device_name() in ['cuda', 'hpu']:
     from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 else:
     from torch.nn import LayerNorm
