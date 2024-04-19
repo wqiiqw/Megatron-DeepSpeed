@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module"""
@@ -10,9 +11,15 @@ from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
 
-_FLOAT_TYPES = (torch.FloatTensor, get_accelerator().FloatTensor)
-_HALF_TYPES = (torch.HalfTensor, get_accelerator().HalfTensor)
-_BF16_TYPES = (torch.BFloat16Tensor, get_accelerator().BFloat16Tensor)
+if get_accelerator().device_name() == "hpu":
+    # revert this once [SW-160732] is fixed
+    _FLOAT_TYPES = (torch.FloatTensor, )
+    _HALF_TYPES = (torch.HalfTensor, )
+    _BF16_TYPES = (torch.BFloat16Tensor, )
+else:
+    _FLOAT_TYPES = (torch.FloatTensor, get_accelerator().FloatTensor)
+    _HALF_TYPES = (torch.HalfTensor, get_accelerator().HalfTensor)
+    _BF16_TYPES = (torch.BFloat16Tensor, get_accelerator().BFloat16Tensor)
 
 
 
