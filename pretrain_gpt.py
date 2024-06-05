@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain GPT"""
@@ -28,7 +29,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, parallel_output=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
@@ -51,7 +52,7 @@ def model_provider(pre_process=True, post_process=True):
             model = GPTModelPipe(
                 config=config,
                 num_tokentypes=0,
-                parallel_output=True
+                parallel_output=parallel_output
             )
             # This is a hack to give us a reference to get_batch_pipe from within training.py
             # We need to call model.set_batch_fn after deepspeed.initialize
@@ -71,18 +72,23 @@ def model_provider(pre_process=True, post_process=True):
             elif args.bf16:
                 attention_mask = attention_mask.bfloat16()
 
-            # Attention mask must be bool.
-            args.attn_mask = attention_mask.to(torch.bool)
+            if args.mask_tensor_adding:
+                args.attn_mask = attention_mask * -10000.0
+            else:
+                # Attention mask must be bool.
+                args.attn_mask = attention_mask.to(torch.bool)
 
             # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
             if args.use_rotary_position_embeddings:
                 update_rotary_pos_emb(args.seq_length)
 
         else:
+            assert not args.use_alibi_position_embeddings, \
+                "GPTModel doesn't yet support ALiBi positional encoding"
             model = GPTModel(
                 config=config,
                 num_tokentypes=0,
-                parallel_output=True,
+                parallel_output=parallel_output,
                 pre_process=pre_process,
                 post_process=post_process
             )
@@ -108,8 +114,13 @@ def get_batch(data_iterator):
 
     # Unpack.
     tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    if not args.use_seq_len_plus_one_tokens:
+        labels = torch.roll(tokens_, shifts=-1, dims=1)
+        labels[:, -1] = -1
+        tokens = tokens_
+    else:
+        labels = tokens_[:, 1:].contiguous()
+        tokens = tokens_[:, :-1].contiguous()
 
     # Get the masks and postition ids.
     skip_mask = args.use_flash_attn or args.use_flash_attn_triton
@@ -119,7 +130,9 @@ def get_batch(data_iterator):
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss,
-        skip_mask)
+        skip_mask,
+        labels = labels,
+        dummy_sample= None,)
 
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
@@ -135,6 +148,9 @@ def get_batch(data_iterator):
     sub_seq_length = seq_length // seq_parallel_world_size
     sub_seq_start = seq_parallel_world_rank * sub_seq_length
     sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+
+    tokens[tokens == -1] = 0
+    labels[labels == -1] = 0
 
     tokens = tokens[:, sub_seq_start:sub_seq_end]
     position_ids = position_ids[:, sub_seq_start:sub_seq_end]
@@ -183,8 +199,13 @@ def get_batch_pipe(data):
 
     # Unpack.
     tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    if not args.use_seq_len_plus_one_tokens:
+        labels = torch.roll(tokens_, shifts=-1, dims=1)
+        labels[:, -1] = -1
+        tokens = tokens_
+    else:
+        labels = tokens_[:, 1:].contiguous()
+        tokens = tokens_[:, :-1].contiguous()
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
@@ -192,7 +213,13 @@ def get_batch_pipe(data):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.eod_mask_loss,
+        labels = labels,
+        dummy_sample = None,)
+
+    tokens[tokens == -1] = 0
+    labels[labels == -1] = 0
+
     if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
         # seqlen-based curriculum learning
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
@@ -318,7 +345,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_data_prefix=args.train_data_path,
         valid_data_prefix=args.valid_data_path,
         test_data_prefix=args.test_data_path,
-        data_cache_path=args.data_cache_path)
+        data_cache_path=args.data_cache_path,
+        use_seq_len_plus_one_tokens=args.use_seq_len_plus_one_tokens)
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds

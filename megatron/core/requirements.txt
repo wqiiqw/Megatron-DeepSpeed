@@ -1,3 +1,8 @@
 pybind11
 torch
 regex
+einops
+datasets
+sentencepiece
+transformers
+nltk
