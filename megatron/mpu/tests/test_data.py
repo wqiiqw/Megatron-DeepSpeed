@@ -1,10 +1,11 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from commons import print_separator
-from commons import initialize_distributed
+from .commons import print_separator
+from .commons import initialize_distributed
 from deepspeed.accelerator import get_accelerator
-from mpu import data as data_utils
-import mpu
+from megatron.core import mpu
+from megatron.core.tensor_parallel import data as data_utils
 import torch
 import functools
 import operator

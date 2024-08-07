@@ -11,7 +11,7 @@ if [ "$OUTPUT_PATH" == "" ]; then
 fi
 
 # Training Loss
-python3 examples_deepspeed/universal_checkpointing/tb_analysis/tb_analysis_script.py \
+python3 tb_analysis/tb_analysis_script.py \
     --tb_dir $OUTPUT_PATH \
     --tb_event_key "lm-loss-training/lm loss" \
     --plot_name "uc_char_training_loss.png" \
@@ -19,7 +19,7 @@ python3 examples_deepspeed/universal_checkpointing/tb_analysis/tb_analysis_scrip
     --use_sns
 
 # Validation Loss
-python3 examples_deepspeed/universal_checkpointing/tb_analysis/tb_analysis_script.py \
+python3 tb_analysis/tb_analysis_script.py \
     --tb_dir $OUTPUT_PATH \
     --tb_event_key "lm-loss-validation/lm loss validation" \
     --csv_name "val_" \

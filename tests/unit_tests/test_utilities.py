@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import os
 import torch
 import megatron.core.parallel_state as ps
@@ -5,7 +7,7 @@ import megatron.core.parallel_state as ps
 class Utils:
 
     world_size = torch.cuda.device_count()
-    rank = int(os.environ['LOCAL_RANK'])
+    rank = int(os.getenv('LOCAL_RANK', 0))
 
     @staticmethod
     def initialize_distributed():
