@@ -1,14 +1,16 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from mpu import layers
-from commons import set_random_seed
-from commons import print_separator
-from commons import initialize_distributed
-import mpu
+from megatron.core.tensor_parallel import layers
+from .commons import set_random_seed
+from .commons import print_separator
+from .commons import initialize_distributed
+from megatron.core import mpu
 from torch.nn.parameter import Parameter
 import torch.nn.init as init
 import torch
 import random
+from deepspeed.accelerator import get_accelerator
 import sys
 sys.path.append("../..")
 

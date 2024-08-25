@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
@@ -75,6 +76,8 @@ class TransformerConfig(ModelParallelConfig):
                                    This kernel only supports a fixed set of hidden sizes.
                                    Defaults to False.
         bias_dropout_fusion (bool): If true, uses bias dropout fusion.
+        use_fused_sdpa (bool): If true, use Fused Scaled Dot Product Attention.
+        use_fused_sdpa_with_recompute (bool): If true, use Fused Scaled Dot Product Attention with recompute feature.
 
         # activation recomputation
 
@@ -137,6 +140,8 @@ class TransformerConfig(ModelParallelConfig):
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
+    use_fused_sdpa: bool = True
+    use_fused_sdpa_with_recompute: bool = False
 
     # activation recomputation
     recompute_granularity: str = None

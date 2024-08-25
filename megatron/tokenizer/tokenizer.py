@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron tokenizers."""
@@ -34,18 +35,21 @@ def build_tokenizer(args):
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+        tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model, args.eval_add_bos)
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
     elif args.tokenizer_type == 'HFTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = _HFTokenizer(args.tokenizer_model,args.seq_length)
+        tokenizer = _HFTokenizer(args.tokenizer_model,args.seq_length,
+                                 args.trust_remote_code)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
     
     # Add vocab size.
+    if args.vocab_size is None:
+        args.vocab_size = tokenizer.vocab_size
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                       args)
 
@@ -294,12 +298,12 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 class _SentencePieceTokenizer(AbstractTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file, vocab_extra_ids=0):
+    def __init__(self, model_file, add_bos=False, vocab_extra_ids=0):
         name = 'SentencePieceTokenizer'
         super().__init__(name)
 
         import sentencepiece
-        self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
+        self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file, add_bos=add_bos)
         self._initalize(vocab_extra_ids)
 
     def _populate_vocab(self):
@@ -468,8 +472,8 @@ class _SentencePieceTokenizer(AbstractTokenizer):
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file,):
-        super().__init__(model_file, vocab_extra_ids=0)
+    def __init__(self, model_file, add_bos=False):
+        super().__init__(model_file, add_bos=add_bos, vocab_extra_ids=0)
 
     def _initalize(self, vocab_extra_ids):
         self._populate_vocab()
@@ -540,10 +544,13 @@ class _NullTokenizer:
 
 class _HFTokenizer(AbstractTokenizer):
     """HF Tokenizer"""
-    def __init__(self, tokenizer_name_or_path,max_seq_len):
+    def __init__(self, tokenizer_name_or_path,max_seq_len, trust_remote_code):
         name = tokenizer_name_or_path
         super().__init__(name)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,padding_side="right",use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,
+                                                       padding_side="right",
+                                                       trust_remote_code=trust_remote_code,
+                                                       use_fast=False)
         
         DEFAULT_PAD_TOKEN = "[PAD]"
         DEFAULT_EOS_TOKEN = "</s>"

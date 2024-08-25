@@ -1,11 +1,12 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from commons import set_random_seed
-from commons import IdentityLayer
-from commons import print_separator
-from commons import initialize_distributed
-from mpu.cross_entropy import vocab_parallel_cross_entropy
-import mpu
+from .commons import set_random_seed
+from .commons import IdentityLayer
+from .commons import print_separator
+from .commons import initialize_distributed
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core import mpu
 import torch.nn.functional as F
 import torch
 import random

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import argparse
@@ -6,7 +7,7 @@ import random
 import numpy
 import torch
 
-import mpu
+from megatron.core import mpu
 from deepspeed.accelerator import get_accelerator
 
 class IdentityLayer(torch.nn.Module):
@@ -54,7 +55,7 @@ def initialize_distributed(backend='nccl'):
     master_port = os.getenv('MASTER_PORT', '6000')
     init_method += master_ip + ':' + master_port
     torch.distributed.init_process_group(
-        backend=backend,
+        backend=get_accelerator().communication_backend_name(),
         world_size=world_size,
         rank=rank,
         init_method=init_method)
