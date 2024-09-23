@@ -9,7 +9,7 @@ VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
 DS_CONFIG=ds_config.json
 
-TP=8  # Tensor Parallelism across 8 HPUs
+TP=1  # Tensor Parallelism across 8 HPUs
 PP=1  # No Pipeline Parallelism
 
 # GPT3 6.7B
@@ -17,7 +17,7 @@ NLAYERS=32
 HIDDEN=4096
 NUMATTNHEADS=32
 
-GLOBAL_BATCH=64  # Adjusted for single node with 8 HPUs
+GLOBAL_BATCH=8  # Adjusted for single node with 8 HPUs
 MICRO_BATCH=8    # Adjusted for single node with 8 HPUs
 
 ZERO_STAGE=2
