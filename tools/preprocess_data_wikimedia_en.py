@@ -15,13 +15,18 @@ merge_file = "./gpt2-merges.txt"
 tokenizer_type = "GPT2BPETokenizer"
 append_eod = True
 workers = 64
+NUM_OF_TEXT_ITEMS = 0 # 1000  # Set this to the desired number of text items to process, 0 means process all
 
 # Load the dataset
 print("Loading dataset...")
 dataset = load_dataset(dataset_name, subset_name, split='train')
 
 # Sort the dataset by a consistent key (e.g., document ID or text)
-dataset = sorted(dataset, key=lambda x: x['text'])
+#dataset = sorted(dataset, key=lambda x: x['text'])
+
+# If NUM_OF_TEXT_ITEMS is specified and non-zero, limit the dataset
+if NUM_OF_TEXT_ITEMS > 0:
+    dataset = dataset[:NUM_OF_TEXT_ITEMS]
 
 # Initialize the tokenizer
 print("Initializing tokenizer...")
