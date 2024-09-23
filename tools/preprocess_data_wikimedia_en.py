@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 # Define paths and parameters
 dataset_name = "wikimedia/wikipedia"
-subset_name = "20231102.en"
+subset_name = "20231101.en"
 output_prefix = "./tokenized_wikipedia"
 vocab_file = "./gpt2-vocab.json"
 merge_file = "./gpt2-merges.txt"
