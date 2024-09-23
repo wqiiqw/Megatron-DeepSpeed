@@ -11,8 +11,11 @@ DS_CONFIG=ds_config.json
 
 TP=1
 PP=1
-NLAYERS=24
-HIDDEN=512
+
+# GPT3 6.7B
+NLAYERS=32
+HIDDEN=4096
+NUMATTNHEADS=32
 
 GLOBAL_BATCH=64
 MICRO_BATCH=4
@@ -57,7 +60,7 @@ deepspeed ../pretrain_gpt.py \
     --pipeline-model-parallel-size $PP \
     --num-layers $NLAYERS \
     --hidden-size $HIDDEN \
-    --num-attention-heads 16 \
+    --num-attention-heads $NUMATTNHEADS \
     --seq-length 256 \
     --loss-scale 12 \
     --max-position-embeddings 1024 \
