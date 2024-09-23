@@ -3,6 +3,8 @@ import json
 import numpy as np
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # Define paths and parameters
 dataset_name = "wikimedia/wikipedia"
@@ -18,6 +20,9 @@ workers = 64
 print("Loading dataset...")
 dataset = load_dataset(dataset_name, subset_name, split='train')
 
+# Sort the dataset by a consistent key (e.g., document ID or text)
+dataset = sorted(dataset, key=lambda x: x['text'])
+
 # Initialize the tokenizer
 print("Initializing tokenizer...")
 tokenizer = GPT2Tokenizer(vocab_file=vocab_file, merges_file=merge_file)
@@ -29,9 +34,14 @@ def tokenize_document(document):
         tokens.append(tokenizer.eos_token_id)
     return tokens
 
-# Tokenize the dataset
+# Tokenize the dataset using multiple worker threads with a progress bar
 print("Tokenizing dataset...")
-tokenized_data = [tokenize_document(doc) for doc in dataset]
+tokenized_data = []
+
+with ThreadPoolExecutor(max_workers=workers) as executor:
+    futures = [executor.submit(tokenize_document, doc) for doc in dataset]
+    for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizing"):
+        tokenized_data.append(future.result())
 
 # Save tokenized data to binary and index files
 print("Saving tokenized data...")
