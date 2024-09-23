@@ -21,7 +21,7 @@ print("Loading dataset...")
 dataset = load_dataset(dataset_name, subset_name, split='train')
 
 # Sort the dataset by a consistent key (e.g., document ID or text)
-dataset = sorted(dataset, key=lambda x: x['text'])
+#dataset = sorted(dataset, key=lambda x: x['text'])
 
 # Initialize the tokenizer
 print("Initializing tokenizer...")
