@@ -3,8 +3,8 @@
 #!/bin/bash
 set -ex
 
-BASE_DATA_PATH=${HL_DATA_DIR_ROOT:-/data/bigscience/oscar-en/}
-DATA_PATH=${BASE_DATA_PATH}/meg-gpt2_text_document
+BASE_DATA_PATH=${HL_DATA_DIR_ROOT:-/scratch-1/llama-training/bigscience/data/oscar/zh/}  #  tokenized_text_document.bin  tokenized_text_document.idx
+DATA_PATH=${BASE_DATA_PATH}/tokenized_text_document
 VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
 DS_CONFIG=ds_config.json
