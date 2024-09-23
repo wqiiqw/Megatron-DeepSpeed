@@ -1,10 +1,8 @@
-# Prepare dataset 
 import os
 import json
 import numpy as np
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
-from megatron.data import indexed_dataset
 
 # Define paths and parameters
 dataset_name = "wikimedia/wikipedia"
@@ -40,14 +38,17 @@ print("Saving tokenized data...")
 output_bin_file = f"{output_prefix}_text_document.bin"
 output_idx_file = f"{output_prefix}_text_document.idx"
 
-# Create indexed dataset builder
-builder = indexed_dataset.make_builder(output_bin_file, impl='mmap', vocab_size=tokenizer.vocab_size)
+# Save the tokenized data to a binary file
+with open(output_bin_file, 'wb') as bin_file:
+    for tokens in tokenized_data:
+        np.array(tokens, dtype=np.int32).tofile(bin_file)
 
-# Add documents to the builder
-for tokens in tokenized_data:
-    builder.add_item(np.array(tokens, dtype=np.int32))
-
-# Finalize the builder
-builder.finalize(output_idx_file)
+# Save the index data to a separate file
+with open(output_idx_file, 'w') as idx_file:
+    offset = 0
+    for tokens in tokenized_data:
+        length = len(tokens)
+        idx_file.write(f"{offset}\t{length}\n")
+        offset += length
 
 print("Tokenized data saved successfully.")
