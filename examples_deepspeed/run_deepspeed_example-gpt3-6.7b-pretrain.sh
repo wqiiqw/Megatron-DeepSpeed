@@ -3,13 +3,13 @@
 #!/bin/bash
 set -ex
 
-BASE_DATA_PATH=${HL_DATA_DIR_ROOT:-/scratch-1/llama-training/bigscience/data/oscar/zh/}  #  tokenized_text_document.bin  tokenized_text_document.idx
+BASE_DATA_PATH=${HL_DATA_DIR_ROOT:-/scratch-1/llama-training/bigscience/data/oscar/zh}  #  tokenized_text_document.bin  tokenized_text_document.idx
 DATA_PATH=${BASE_DATA_PATH}/tokenized_text_document
 VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
 DS_CONFIG=ds_config.json
 
-TP=1  # Tensor Parallelism across 8 HPUs
+TP=8  # Tensor Parallelism across 8 HPUs
 PP=1  # No Pipeline Parallelism
 
 # GPT3 6.7B
@@ -18,9 +18,9 @@ HIDDEN=4096
 NUMATTNHEADS=32
 
 GLOBAL_BATCH=8  # Adjusted for single node with 8 HPUs
-MICRO_BATCH=8    # Adjusted for single node with 8 HPUs
+MICRO_BATCH=1    # Adjusted for single node with 8 HPUs
 
-ZERO_STAGE=2
+ZERO_STAGE=0
 
 OUTPUT_DIR=ds_z${ZERO_STAGE}_nl${NLAYERS}_hs${HIDDEN}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}
 #OUTPUT_DIR=baseline_nl${NLAYERS}_hs${HIDDEN}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}
@@ -53,6 +53,10 @@ ds_args=" --no-pipeline-parallel ${ds_args}"
 ds_args=" --deepspeed_config=$DS_CONFIG ${ds_args}"
 ds_args=" --zero-stage=$ZERO_STAGE ${ds_args}"
 ds_args=" --deepspeed-activation-checkpointing ${ds_args}"
+
+# Set world size to 1
+#export WORLD_SIZE=1
+#export CUDA_VISIBLE_DEVICES=0
 
 
 deepspeed ../pretrain_gpt.py \
