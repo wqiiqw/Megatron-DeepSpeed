@@ -9,16 +9,16 @@ VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
 DS_CONFIG=ds_config.json
 
-TP=1
-PP=1
+TP=8  # Tensor Parallelism across 8 HPUs
+PP=1  # No Pipeline Parallelism
 
 # GPT3 6.7B
 NLAYERS=32
 HIDDEN=4096
 NUMATTNHEADS=32
 
-GLOBAL_BATCH=64
-MICRO_BATCH=4
+GLOBAL_BATCH=64  # Adjusted for single node with 8 HPUs
+MICRO_BATCH=8    # Adjusted for single node with 8 HPUs
 
 ZERO_STAGE=2
 
@@ -64,8 +64,8 @@ deepspeed ../pretrain_gpt.py \
     --seq-length 256 \
     --loss-scale 12 \
     --max-position-embeddings 1024 \
-    --micro-batch-size 4 \
-    --global-batch-size 1024 \
+    --micro-batch-size $MICRO_BATCH  \
+    --global-batch-size $GLOBAL_BATCH \
     --train-iters 1000 \
     --lr 6.0e-5 \
     --min-lr 6.0e-6 \
