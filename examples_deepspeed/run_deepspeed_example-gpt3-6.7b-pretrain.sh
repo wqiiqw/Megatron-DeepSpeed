@@ -20,7 +20,7 @@ NUMATTNHEADS=32
 GLOBAL_BATCH=1024  # Adjusted for single node with 8 HPUs
 MICRO_BATCH=8    # Adjusted for single node with 8 HPUs
 
-ZERO_STAGE=0
+ZERO_STAGE=1
 
 OUTPUT_DIR=ds_z${ZERO_STAGE}_nl${NLAYERS}_hs${HIDDEN}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}
 #OUTPUT_DIR=baseline_nl${NLAYERS}_hs${HIDDEN}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}
@@ -36,8 +36,12 @@ cat <<EOT > $DS_CONFIG
     "stage": $ZERO_STAGE
   },
 
-  "fp16": {
+  "bf16": {
     "enabled": true,
+    "immediate_grad_update": true
+  },
+  "fp16": {
+    "enabled": false,
     "initial_scale_power": 12
   },
 
@@ -65,12 +69,12 @@ deepspeed ../pretrain_gpt.py \
     --num-layers $NLAYERS \
     --hidden-size $HIDDEN \
     --num-attention-heads $NUMATTNHEADS \
-    --seq-length 256 \
+    --seq-length 2048 \
     --loss-scale 12 \
-    --max-position-embeddings 1024 \
+    --max-position-embeddings 4096 \
     --micro-batch-size $MICRO_BATCH  \
     --global-batch-size $GLOBAL_BATCH \
-    --train-iters 1000 \
+    --train-iters 10 \
     --lr 6.0e-5 \
     --min-lr 6.0e-6 \
     --lr-decay-style cosine \
@@ -87,7 +91,7 @@ deepspeed ../pretrain_gpt.py \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --init-method-std 0.006 \
-    --fp16 \
+    --bf16 \
     --checkpoint-activations \
     --recompute-granularity=full \
     --recompute-method=uniform \
